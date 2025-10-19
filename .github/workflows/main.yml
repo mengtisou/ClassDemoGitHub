@@ -1,0 +1,20 @@
+name: MyGitlab Script
+ 
+on:
+  workflow_dispatch:      # Allows manual trigger
+ 
+jobs:
+  buildandtest:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Clone GitLab repo
+      run: |
+        git clone https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com/mengti/classdemo.git
+    - name: Convert Windows line endings to Unix
+      run: sed -i 's/\r$//' classdemo/script.sh
+ 
+    - name: Make script executable
+      run: chmod +x classdemo/script.sh
+ 
+    - name: Run script.sh
+      run: ./classdemo/script.sh
