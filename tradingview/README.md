@@ -13,14 +13,13 @@ File: [`Sn1P3r_Sideway_and_Zone.pine`](Sn1P3r_Sideway_and_Zone.pine)
 
 | Element | What it is |
 |---|---|
-| Grey box + 2 grey lines | Confirmed sideways structure and its high/low levels. The box keeps growing until price breaks out. While the market still passes the sideways test, a new high/low without a confirmed break widens it and the zones move with it; spikes that fail the test are ignored. The latest structure extends right, and older ones stop where the next one starts. A new structure can only start after the previous one has broken out. |
+| Grey box + 2 grey lines | Confirmed sideways structure and its high/low levels. The box keeps growing until price breaks out. During the confirmation window (up to *Confirmation candles* bars after the zone is confirmed), a new high/low without a confirmed break widens it and the zones move with it. Later wicks are ignored. The latest structure extends right, and older ones stop where the next one starts. A new structure can only start after the previous one has broken out. |
 | `BUY ZONE n` / `SELL ZONE n` | Trading-zone ladder built from the structure (see the formula below). |
-| Yellow ▲ `⚡ 50` | ADX crossed the peak level during working hours. |
-| `SCALP OK` | Zone touched during working hours, with ADX flat and ADR spent. |
+| Yellow ▲ `⚡ 50` | ADX at or above the peak level while the Grid rule is open and the session is open, marked once when all three first become true. |
 | `1/3ADR±`, `5ADR±` | Day open ± ADR/3 and ± ADR, drawn from the day start to the last bar + offset. |
 | Top-right table | Status, ADX, Session, 5ADR, Today moved, Used (bar), Left to ADR, Grid rule, Read. |
 | Bottom-centre table | Previous daily ranges (Day -1 on the left; hover a cell to see which day), then `5ADR = …`. The ranges are recorded from the chart's own bars (the first day of the history counts too). If the history is short (e.g. 1m), missing days show `—` and the ADR averages the days available. |
-| Teal and orange vertical lines, `GRID ZONE` | GRID ON and GRID OFF, with the planned grid window as a box. |
+| `🤖 GRID ON` / `⏱ GRID OFF` callouts, teal box | The teal callout shows *Sideways Confirmed · ADX < 30.0 · Day range 53% of 5ADR*. The box starts at the GRID ON candle's close and grows with price until GRID OFF. The orange callout gives the reason (*90 min window (1.5h)*, *🔕 Working hours ended*, …) above a dashed orange end line. The background is tinted teal while the grid runs. |
 | Grey background | Outside working hours (06:00–17:00 UTC+7). |
 
 ## Zone ladder formula
@@ -49,6 +48,8 @@ SELL ZONE 4 = 4325.310 - 4330.728.
 - **GRID OFF** happens when the grid window (90 min) ends, the session closes, the Grid rule shuts, or the danger level is hit (if enabled).
 
 ## Alerts
+
+- The zone-touch alert adds `scalp OK` or `scalp not confirmed` (session open, ADX flat, ADR spent). No chart label is drawn.
 
 - **Any alert() function call**: uses the `Alert() · …` toggles in the settings. These messages include prices and the disclaimer.
 - **Individual conditions**: GRID ON, GRID OFF, ADR gate opened, ADX peak, Sideways zone confirmed, Sideways breakout, Zone touched, Outer zone broken.

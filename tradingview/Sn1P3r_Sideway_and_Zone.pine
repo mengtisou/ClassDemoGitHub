@@ -112,7 +112,7 @@ bool  tzAutoAdd    = input.bool(true, "Auto-add next zone when the outermost is 
 float tzSpacing    = input.float(2.0, "Zone spacing (× range)", minval = 0.1, step = 0.1, group = G_TZ)
 float tzHeight     = input.float(0.5, "Added-zone height (× range)", minval = 0.05, step = 0.05, group = G_TZ)
 int   tzMaxAdded   = input.int(6, "Max added zones per side", minval = 0, group = G_TZ)
-bool  tzScalpCheck = input.bool(true, "Scalp check on zone touch (ADX flat + ADR spent)", group = G_TZ, tooltip = "When price enters a zone during working hours with ADX below the flat level AND the day's range at or above 'Minimum % of 5ADR consumed' → a small SCALP OK marker. The zone-touch alert reports the result either way.")
+bool  tzScalpCheck = input.bool(true, "Scalp check on zone touch (ADX flat + ADR spent)", group = G_TZ, tooltip = "When price enters a zone, the zone-touch alert adds 'scalp OK' if the session is open, ADX is below the flat level AND the day's range is at or above 'Minimum % of 5ADR consumed', otherwise 'scalp not confirmed'.")
 
 // #############################################################################
 // INPUTS — 📐 ZONE · HISTORY
@@ -204,14 +204,15 @@ bool  gridNeedsADX  = input.bool(true, "GRID ON needs ADX peak → flat", group 
 // #############################################################################
 const string G_BOT = "📊 GRID · BOT ZONE"
 int  gridWindowMin      = input.int(90, "Grid Window (minutes)", minval = 1, group = G_BOT)
-bool showGridZoneLabels = input.bool(true, "Show Grid Zone Labels", group = G_BOT)
+bool showGridZoneLabels = input.bool(true, "Show Grid Zone Labels", group = G_BOT, tooltip = "GRID ON / GRID OFF callouts above the grid zone.")
 bool showADXPeakMarkers = input.bool(true, "Show ADX Peak Markers", group = G_BOT)
 
 // #############################################################################
 // INPUTS — 📊 GRID · VISUALS
 // #############################################################################
 const string G_VIS = "📊 GRID · VISUALS"
-color gridFillColor      = input.color(color.new(color.teal, 90), "Grid Zone Fill", group = G_VIS)
+color gridFillColor      = input.color(color.new(color.teal, 78), "Grid Zone Fill", group = G_VIS)
+color gridBgColor        = input.color(color.new(color.teal, 92), "Grid Active Background", group = G_VIS)
 color startLineColor     = input.color(color.teal, "Start Line (Grid ON)", group = G_VIS)
 color endLineColor       = input.color(color.orange, "End Line (Grid OFF)", group = G_VIS)
 color adxPeakMarkerColor = input.color(#FDD835, "ADX Peak Marker", group = G_VIS)
@@ -307,14 +308,6 @@ if adxReady and not adxFlat
     adxReady := false
 bool adxCooling = not na(peakTime)
 
-// markers and alerts only inside working hours
-bool adxPeakEvt  = adxCrossPeak and inHours
-bool adxPeakMark = adxModuleOn and showADXPeakMarkers and adxPeakEvt
-plotshape(adxPeakMark and adxPeakLvl == 50, "ADX peak", shape.triangleup, location.belowbar, adxPeakMarkerColor, text = "⚡ 50", textcolor = color.blue, size = size.small, display = display.pane)
-plotshape(adxPeakMark and adxPeakLvl != 50, "ADX peak (custom level)", shape.triangleup, location.belowbar, adxPeakMarkerColor, text = "⚡ ADX", textcolor = color.blue, size = size.small, display = display.pane)
-if adxModuleOn and alertADXPeakMsg and adxPeakEvt
-    alert(msg("ADX peak reached (" + str.tostring(adxVal, "0.0") + ")"), alert.freq_once_per_bar)
-
 // #############################################################################
 // GRID RULE (5ADR gate + danger)
 // Grid rule = ADR% threshold alone: ≥ Minimum % of 5ADR consumed → open.
@@ -326,23 +319,48 @@ bool adrGateOpened  = gridRuleEnabled and gridGateOpen and not gridGateOpen[1]
 if adxModuleOn and alertADRGate and adrGateOpened
     alert(msg("ADR gate opened - grid may now activate"), alert.freq_once_per_bar)
 
+// ADX peak marker: ADX at / above the peak level while the Grid rule is open and
+// the session is open (marked once, when all three first become true)
+bool adxPeakCond = adxVal >= adxPeakLvl and gridGateOpen and inHours
+bool adxPeakEvt  = adxPeakCond and not adxPeakCond[1]
+bool adxPeakMark = adxModuleOn and showADXPeakMarkers and adxPeakEvt
+plotshape(adxPeakMark and adxPeakLvl == 50, "ADX peak", shape.triangleup, location.belowbar, adxPeakMarkerColor, text = "⚡ 50", textcolor = color.blue, size = size.small, display = display.pane)
+plotshape(adxPeakMark and adxPeakLvl != 50, "ADX peak (custom level)", shape.triangleup, location.belowbar, adxPeakMarkerColor, text = "⚡ ADX", textcolor = color.blue, size = size.small, display = display.pane)
+if adxModuleOn and alertADXPeakMsg and adxPeakEvt
+    alert(msg("ADX peak reached (" + str.tostring(adxVal, "0.0") + ")"), alert.freq_once_per_bar)
+
 // #############################################################################
 // GRID ON / OFF STATE MACHINE
 // #############################################################################
-int   gridBars = math.min(math.max(math.round(gridWindowMin * 60.0 / timeframe.in_seconds()), 5), MAX_FUTURE_BARS)
-float gridHi   = ta.highest(high, gridBars)
-float gridLo   = ta.lowest(low, gridBars)
-
-var bool gridActive   = false
-var bool gridArmed    = true
-var int  gridOpenTime = na
-var box  gridBox      = na
+// Grid zone: starts at the GRID ON candle's close and grows with every high / low
+// until GRID OFF. Teal GRID ON callout + start line, orange GRID OFF callout +
+// dashed end line, light background while the grid runs.
+var bool  gridActive   = false
+var bool  gridArmed    = true
+var int   gridOpenTime = na
+var float gridOnLow    = na
+var float gridTop      = na
+var float gridBot      = na
+var box   gridBox      = na
+var line  gridStartLn  = na
+var label gridOnLbl    = na
 
 bool canOpenGrid = adxModuleOn and inHours and not inFinalWindow and gridGateOpen and not (closeGridIfTooFar and dangerBreached)
 bool gridOnEvt   = false
 bool gridOffEvt  = false
 
 if gridActive
+    // grow the grid zone with this candle
+    gridTop := math.max(gridTop, high)
+    gridBot := math.min(gridBot, low)
+    box.set_right(gridBox, bar_index)
+    box.set_top(gridBox, gridTop)
+    box.set_bottom(gridBox, gridBot)
+    line.set_y1(gridStartLn, math.min(gridOnLow, gridBot))
+    line.set_y2(gridStartLn, gridTop)
+    if not na(gridOnLbl)
+        label.set_y(gridOnLbl, gridTop)
+
     bool byWindow = time - gridOpenTime >= gridWindowMin * 60000
     bool byHours  = enableWorkingHours and not inHours
     bool byDanger = closeGridIfTooFar and dangerBreached
@@ -350,11 +368,12 @@ if gridActive
     if byWindow or byHours or byDanger or byGate or not adxModuleOn
         gridActive := false
         gridOffEvt := true
-        line.new(bar_index, low, bar_index, high, extend = extend.both, color = endLineColor, width = 2)
-        if not na(gridBox)
-            box.set_right(gridBox, bar_index)
+        line.new(bar_index, gridBot, bar_index, gridTop, color = endLineColor, style = line.style_dashed, width = 2)
+        string why   = byWindow ? str.tostring(gridWindowMin) + " min window (" + str.tostring(gridWindowMin / 60.0, "#.#") + "h)" : byHours ? "Working hours ended" : byDanger ? "Danger level hit" : "ADR gate shut"
+        string icon  = byWindow ? "⏱" : byHours ? "🔕" : byDanger ? "⛔" : "🔒"
+        if showGridZoneLabels
+            label.new(bar_index, gridTop, icon + " GRID OFF\n" + why, style = label.style_label_down, color = color.new(endLineColor, 10), textcolor = color.white, size = size.small)
         if alertGridOff
-            string why = byWindow ? "grid window done" : byHours ? "session closed" : byDanger ? "danger level hit" : "ADR gate shut"
             alert(msg("GRID OFF (" + why + ")"), alert.freq_once_per_bar)
 else
     if not canOpenGrid
@@ -366,12 +385,18 @@ else
         gridArmed    := false
         adxReady     := false
         gridOpenTime := time
-        line.new(bar_index, low, bar_index, high, extend = extend.both, color = startLineColor, width = 2)
-        gridBox := box.new(bar_index, gridHi, bar_index + gridBars, gridLo, border_color = color.new(startLineColor, 40), bgcolor = gridFillColor)
-        if showGridZoneLabels
-            label.new(bar_index, gridHi, "GRID ZONE", style = label.style_label_down, color = color.new(chart.fg_color, 80), textcolor = chart.fg_color, size = size.small)
+        gridOnLow    := low
+        gridTop      := close
+        gridBot      := close
+        gridStartLn  := line.new(bar_index, low, bar_index, gridTop, color = startLineColor, width = 2)
+        gridBox      := box.new(bar_index, gridTop, bar_index, gridBot, border_color = startLineColor, border_width = 1, bgcolor = gridFillColor)
+        string dayTxt = "Day range " + (na(usedPct) ? "n/a" : str.tostring(usedPct, "#") + "%") + " of " + adrName
+        string onTxt  = "🤖 GRID ON\n" + (gridNeedsADX ? "Sideways Confirmed\nADX < " + str.tostring(adxFlatLvl, "0.0") : "Grid rule open") + "\n" + dayTxt
+        gridOnLbl    := showGridZoneLabels ? label.new(bar_index, gridTop, onTxt, style = label.style_label_down, color = color.new(startLineColor, 10), textcolor = color.white, size = size.small) : na
         if alertGridOn
-            alert(msg("GRID ON · zone " + fmtPrice(gridLo) + " - " + fmtPrice(gridHi)), alert.freq_once_per_bar)
+            alert(msg("GRID ON · " + dayTxt), alert.freq_once_per_bar)
+
+bgcolor(adxModuleOn and (gridActive or gridOffEvt) ? gridBgColor : na, title = "Grid active")
 
 // #############################################################################
 // SIDEWAYS DETECTION
@@ -558,9 +583,9 @@ if fibModuleOn
                 boDnEvt   := true
                 if boMark
                     label.new(bar_index, high, "▼ BREAKDOWN", yloc = yloc.abovebar, style = label.style_label_down, color = color.orange, textcolor = color.white, size = size.tiny)
-            // while the market is still sideways (tight-range test passes) a new high / low
-            // without a (pending) break widens the structure; spikes that fail the test are ignored
-            if cur.state == 0 and isTight and upStreak == 0 and dnStreak == 0 and (high > cur.top or low < cur.bottom)
+            // during the confirmation window (≤ Confirmation candles after the zone is
+            // confirmed, still sideways, no pending break) a new high / low widens it
+            if cur.state == 0 and bar_index - cur.confirmBar <= swConfirm and isTight and upStreak == 0 and dnStreak == 0 and (high > cur.top or low < cur.bottom)
                 cur.top    := math.max(cur.top, high)
                 cur.bottom := math.min(cur.bottom, low)
                 cur.relayout()
@@ -615,8 +640,6 @@ if fibModuleOn
         if touchBuy or touchSell
             zoneTouchEvt := true
             bool scalpOk = inHours and adxFlat and not na(usedPct) and usedPct >= minPctADRConsumed
-            if tzScalpCheck and scalpOk
-                label.new(bar_index, touchBuy ? low : high, "SCALP OK", yloc = touchBuy ? yloc.belowbar : yloc.abovebar, style = touchBuy ? label.style_label_up : label.style_label_down, color = color.new(color.lime, 20), textcolor = color.black, size = size.tiny)
             if alZoneTouch
                 alert(msg("Price touched " + touchName + (tzScalpCheck ? " - scalp " + (scalpOk ? "OK" : "not confirmed") : "")), alert.freq_once_per_bar)
 
