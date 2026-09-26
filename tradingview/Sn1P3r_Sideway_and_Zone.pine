@@ -1,0 +1,686 @@
+//@version=6
+indicator("Sn1P3r Sideway and Zone", shorttitle = "Sn1P3r S&Z", overlay = true, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// =============================================================================
+//  Sn1P3r Sideway and Zone  ·  Pine Script v6
+//
+//  📐 Fib Zone module
+//     Sideways (consolidation) detection → grey structure box + structure
+//     levels (0 = zone high, 1 = zone low) → BUY / SELL trading-zone ladder.
+//
+//     Ladder, with R = zone high − zone low, S = zone spacing, H = zone height:
+//        BUY  ZONE 2k−1 : top    = high − S·k·R , bottom = top − H·R
+//        SELL ZONE 2k   : bottom = high + S·k·R , top    = bottom + H·R
+//     Defaults S = 2, H = 0.5 give  BUY 1 = low − 1R, SELL 2 = high + 2R,
+//     BUY 3 = low − 3R, SELL 4 = high + 4R. When the outermost zone of a side
+//     is broken, the next zone is added one spacing further out.
+//
+//  📊 ADX Grid detector
+//     ADX peak → flat detector, 5ADR grid rule, working hours (UTC+7),
+//     ADR levels, range dashboard, previous daily ranges, GRID ON / OFF.
+// =============================================================================
+
+// #############################################################################
+// TYPES
+// #############################################################################
+type Zone
+    float top
+    float bottom
+    int   num
+    bool  isBuy
+    box   bx
+    bool  wasIn = false
+
+type Structure
+    int         left
+    int         confirmBar
+    float       top
+    float       bottom
+    box         swBox
+    line        hiLn
+    line        loLn
+    array<Zone> buys
+    array<Zone> sells
+    int         state      = 0     // 0 = unbroken, 1 = broke up, -1 = broke down
+    int         addedBuys  = 0
+    int         addedSells = 0
+
+// #############################################################################
+// CONSTANTS
+// #############################################################################
+const string DISCLAIMER      = "\n(Automated technical signal - not financial advice)"
+const int    INIT_ZONES_SIDE = 2       // BUY and SELL zones created with every structure
+const int    MAX_RANGE_CELLS = 10      // previous daily ranges shown in the bottom table
+const int    MAX_FUTURE_BARS = 500     // Pine limit for drawings to the right of the last bar
+const int    MAX_PAST_BARS   = 4999    // keep late-added zones inside the drawable history
+
+// #############################################################################
+// INPUTS — 🧩 MODULES
+// #############################################################################
+const string G_MOD = "🧩 MODULES"
+bool fibModuleOn = input.bool(true, "📐 Fib Zone module", group = G_MOD, tooltip = "Sideways (consolidation) detection → structure box, Fibonacci structure levels and the BUY / SELL trading-zone ladder.")
+bool adxModuleOn = input.bool(true, "📊 ADX Grid detector", group = G_MOD, tooltip = "Grid-bot helper: ADX peak → flat detector, 5ADR grid rule, working-hours filter, ADR levels, range dashboard and GRID ON / OFF markers.")
+
+// #############################################################################
+// INPUTS — 📐 ZONE · SIDEWAYS DETECTION
+// #############################################################################
+const string G_SW = "📐 ZONE · SIDEWAYS DETECTION"
+int   swMinCandles    = input.int(20, "Minimum consolidation candles", minval = 5, group = G_SW, tooltip = "How many candles price must stay inside a tight range before it can count as a sideways zone.")
+float swMaxRangePct   = input.float(2.5, "Maximum range %", minval = 0.01, step = 0.1, group = G_SW, tooltip = "Zone height limit as a % of price: (highest high − lowest low) ÷ lowest low × 100.")
+int   swConfirm       = input.int(2, "Confirmation candles", minval = 1, group = G_SW, tooltip = "Consecutive candles the tight-range conditions must hold before the zone is confirmed and drawn.")
+bool  swUseAtr        = input.bool(true, "ATR filter", inline = "swAtr", group = G_SW)
+int   swAtrLen        = input.int(14, "Len", minval = 1, inline = "swAtr", group = G_SW)
+float swAtrMult       = input.float(3.0, "Range ≤ ATR ×", minval = 0.1, step = 0.1, inline = "swAtr", group = G_SW, tooltip = "The zone height must also be ≤ ATR(Len) × this value, so the filter adapts to the symbol's volatility. The same ATR is used by the ATR breakout method.")
+bool  swUseVol        = input.bool(false, "Volume filter", inline = "swVol", group = G_SW)
+int   swVolBaseLen    = input.int(100, "Baseline len", minval = 1, inline = "swVol", group = G_SW)
+float swVolMult       = input.float(1.2, "Zone vol ≤ base ×", minval = 0.1, step = 0.1, group = G_SW, tooltip = "Volume filter: the average volume inside the zone must be ≤ SMA(volume, Baseline len) × this value (a quiet market).")
+bool  swShowBox       = input.bool(true, "Show sideways zone box", group = G_SW)
+bool  swShowPotential = input.bool(false, "Mark potential (unconfirmed) zones", group = G_SW)
+color swFillCol       = input.color(color.new(color.gray, 82), "Zone fill", group = G_SW)
+
+// #############################################################################
+// INPUTS — 📐 ZONE · BREAKOUT
+// #############################################################################
+const string G_BO = "📐 ZONE · BREAKOUT"
+string boMethod  = input.string("Close beyond", "Confirmation method", options = ["Close beyond", "Wick beyond", "Percent beyond", "ATR beyond"], group = G_BO)
+float  boPct     = input.float(0.25, "Breakout % (Percent method)", minval = 0, step = 0.05, group = G_BO)
+float  boAtrMult = input.float(0.5, "ATR multiplier (ATR method)", minval = 0, step = 0.1, group = G_BO)
+int    boConfirm = input.int(1, "Confirmation candles", minval = 1, group = G_BO, tooltip = "Consecutive candles that must pass the breakout rule before a break is confirmed. Used for the sideways-structure breakout and for the outer-zone break that adds a new zone.")
+bool   boMark    = input.bool(false, "Mark breakouts on chart", group = G_BO)
+
+// #############################################################################
+// INPUTS — 📐 ZONE · FIBONACCI
+// #############################################################################
+const string G_FIB = "📐 ZONE · FIBONACCI"
+bool fibShow    = input.bool(true, "Show Fib levels", group = G_FIB)
+int  fibWidth   = input.int(1, "Fib line width", minval = 1, maxval = 4, group = G_FIB, tooltip = "Width of the structure levels drawn at the sideways zone high (0) and low (1).")
+bool fibExtend  = input.bool(true, "Extend current structure right", group = G_FIB, tooltip = "ON: the newest structure's levels and trading zones run to the right edge of the chart. Older structures always stop where the next structure starts.")
+int  fibExtBars = input.int(40, "Fixed extension (bars)", minval = 1, maxval = MAX_FUTURE_BARS, group = G_FIB, tooltip = "Bars the current structure is projected past its confirmation candle. It is the full length when 'Extend current structure right' is OFF, and the anchor of the zone text when it is ON.")
+
+// #############################################################################
+// INPUTS — 📐 ZONE · TRADING ZONES
+// #############################################################################
+const string G_TZ = "📐 ZONE · TRADING ZONES"
+bool  tzShow       = input.bool(true, "Show trading zones", group = G_TZ)
+int   tzTransp     = input.int(82, "Zone transparency", minval = 0, maxval = 100, group = G_TZ)
+bool  tzLabels     = input.bool(true, "Show BUY/SELL labels", group = G_TZ)
+bool  tzPrices     = input.bool(true, "Show zone prices", group = G_TZ)
+color tzBuyCol     = input.color(#089981, "BUY", inline = "tzCol", group = G_TZ)
+color tzSellCol    = input.color(#F23645, "SELL", inline = "tzCol", group = G_TZ)
+bool  tzAutoAdd    = input.bool(true, "Auto-add next zone when the outermost is broken", group = G_TZ, tooltip = "When price confirms a break beyond the outermost BUY (or SELL) zone of the current structure, a new zone is added one spacing further out on that side.")
+float tzSpacing    = input.float(2.0, "Zone spacing (× range)", minval = 0.1, step = 0.1, group = G_TZ)
+float tzHeight     = input.float(0.5, "Added-zone height (× range)", minval = 0.05, step = 0.05, group = G_TZ)
+int   tzMaxAdded   = input.int(6, "Max added zones per side", minval = 0, group = G_TZ)
+bool  tzScalpCheck = input.bool(true, "Scalp check on zone touch (ADX flat + ADR spent)", group = G_TZ, tooltip = "When price enters a zone: ADX below the flat level AND the day's range at or above 'Minimum % of 5ADR consumed' → a small SCALP OK marker. The zone-touch alert reports the result either way.")
+
+// #############################################################################
+// INPUTS — 📐 ZONE · HISTORY
+// #############################################################################
+const string G_HIST = "📐 ZONE · HISTORY"
+bool histKeep = input.bool(true, "Keep old zones", group = G_HIST)
+int  histMax  = input.int(4, "Maximum historical zones", minval = 0, maxval = 50, group = G_HIST, tooltip = "How many previous structures (box, levels and trading zones) stay on the chart next to the current one.")
+
+// #############################################################################
+// INPUTS — 📐 ZONE · ALERTS
+// #############################################################################
+const string G_ZAL = "📐 ZONE · ALERTS"
+bool alZoneTouch = input.bool(true, "Alert() · Price touched a zone", group = G_ZAL)
+bool alZoneBreak = input.bool(true, "Alert() · Outer zone broken (new zone added)", group = G_ZAL)
+
+// #############################################################################
+// INPUTS — 📊 GRID · GENERAL / GRID RULE
+// #############################################################################
+const string G_GEN = "📊 GRID · GENERAL / GRID RULE"
+int   lineLabelOffset   = input.int(50, "Line / Label Offset (bars)", minval = 0, maxval = MAX_FUTURE_BARS, group = G_GEN)
+bool  showPrevRangesTbl = input.bool(true, "Show Previous Daily Ranges Table", group = G_GEN)
+bool  gridRuleEnabled   = input.bool(true, "GRID RULE — only open grid AFTER day range passes % of 5ADR", group = G_GEN)
+float minPctADRConsumed = input.float(50, "Minimum % of 5ADR consumed", minval = 0, group = G_GEN)
+bool  closeGridIfTooFar = input.bool(false, "Close an ACTIVE grid if the day range goes too far", group = G_GEN)
+float dangerLevelPct    = input.float(100, "Danger level — % of 5ADR", minval = 0, group = G_GEN)
+
+// #############################################################################
+// INPUTS — 📊 GRID · RANGE DASHBOARD
+// #############################################################################
+const string G_DASH = "📊 GRID · RANGE DASHBOARD"
+bool   showDashboard   = input.bool(true, "Show Range Dashboard", group = G_DASH)
+string dashPositionStr = input.string("top_right", "Position", options = ["top_right", "top_left", "bottom_right", "bottom_left"], group = G_DASH)
+string dashTextSizeStr = input.string("Small", "Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = G_DASH)
+
+// #############################################################################
+// INPUTS — 📊 GRID · ALERT MESSAGES
+// #############################################################################
+const string G_AMSG = "📊 GRID · ALERT MESSAGES"
+bool alertGridOn      = input.bool(true, "Alert() · GRID ON", group = G_AMSG)
+bool alertGridOff     = input.bool(true, "Alert() · GRID OFF", group = G_AMSG)
+bool alertADRGate     = input.bool(false, "Alert() · ADR gate opened", group = G_AMSG)
+bool alertADXPeakMsg  = input.bool(false, "Alert() · ADX peak", group = G_AMSG)
+bool appendDisclaimer = input.bool(true, "Append disclaimer to every message", group = G_AMSG)
+
+// #############################################################################
+// INPUTS — 📊 GRID · WORKING HOURS (UTC+7 · PHNOM PENH)
+// #############################################################################
+const string G_HRS = "📊 GRID · WORKING HOURS (UTC+7 · PHNOM PENH)"
+bool  enableWorkingHours = input.bool(true, "Enable Working Hours Filter", group = G_HRS)
+int   startHour          = input.int(6, "Start Hour", minval = 0, maxval = 23, group = G_HRS)
+int   startMin           = input.int(0, "Start Min", minval = 0, maxval = 59, group = G_HRS)
+int   endHour            = input.int(17, "End Hour", minval = 0, maxval = 23, group = G_HRS)
+int   endMin             = input.int(0, "End Min", minval = 0, maxval = 59, group = G_HRS)
+int   noNewGridFinalMin  = input.int(30, "No New Grid — Final Minutes", minval = 0, group = G_HRS)
+bool  shadeOutsideHours  = input.bool(true, "Shade Outside Working Hours", group = G_HRS)
+color offHoursShadeColor = input.color(color.new(color.gray, 90), "Off-Hours Shade", group = G_HRS)
+
+// #############################################################################
+// INPUTS — 📊 GRID · ADR · AVERAGE DAILY RANGE
+// #############################################################################
+const string G_ADR = "📊 GRID · ADR · AVERAGE DAILY RANGE"
+bool   enableADR         = input.bool(true, "Enable ADR Module", group = G_ADR)
+int    adrDays           = input.int(5, "ADR Days", minval = 1, group = G_ADR)
+bool   autoColourLines   = input.bool(true, "Auto Colour Lines (use chart foreground)", group = G_ADR)
+bool   show5ADRLines     = input.bool(true, "Show 5ADR +/- Lines", group = G_ADR)
+string style5ADRStr      = input.string("Solid", "5ADR Line Style", options = ["Solid", "Dashed", "Dotted"], group = G_ADR)
+color  color5ADR         = input.color(color.gray, "5ADR Line Colour (if not auto)", group = G_ADR)
+bool   show13ADRLines    = input.bool(true, "Show 1/3 ADR Lines", group = G_ADR)
+string style13ADRStr     = input.string("Dotted", "1/3 ADR Line Style", options = ["Solid", "Dashed", "Dotted"], group = G_ADR)
+color  color13ADR        = input.color(color.gray, "1/3 ADR Line Colour (if not auto)", group = G_ADR)
+bool   showDayAnchor     = input.bool(false, "Show Day Anchor (vertical)", group = G_ADR)
+string styleDayAnchorStr = input.string("Dotted", "Day Anchor Style", options = ["Solid", "Dashed", "Dotted"], group = G_ADR)
+color  colorDayAnchor    = input.color(color.gray, "Day Anchor Colour (if not auto)", group = G_ADR)
+bool   keepHistoricalADR = input.bool(false, "Keep Historical ADR Levels", group = G_ADR)
+
+// #############################################################################
+// INPUTS — 📊 GRID · ADX
+// #############################################################################
+const string G_ADX = "📊 GRID · ADX"
+int   adxLength     = input.int(10, "ADX Length", minval = 1, group = G_ADX)
+int   adxSmoothing  = input.int(14, "ADX Smoothing", minval = 1, group = G_ADX)
+float adxPeakLvl    = input.float(50, "ADX Peak — High Volatility", group = G_ADX)
+float adxFlatLvl    = input.float(30, "ADX Flat — Sideways Confirm", group = G_ADX)
+int   peakExpiryMin = input.int(120, "Peak Expiry — Stall Minutes", minval = 1, group = G_ADX, tooltip = "After ADX crosses the peak level it has this many minutes to fall below the flat level. If it stalls above the flat level for longer, the peak expires.")
+bool  gridNeedsADX  = input.bool(true, "GRID ON needs ADX peak → flat", group = G_ADX, tooltip = "ON: a grid opens only after ADX has peaked and then fallen below the flat level (volatility spent → sideways), and the Grid rule, session and danger checks all pass. OFF: a grid opens as soon as the Grid rule, session and danger checks pass, at most once each time they become true.")
+
+// #############################################################################
+// INPUTS — 📊 GRID · BOT ZONE
+// #############################################################################
+const string G_BOT = "📊 GRID · BOT ZONE"
+int  gridWindowMin      = input.int(90, "Grid Window (minutes)", minval = 1, group = G_BOT)
+bool showGridZoneLabels = input.bool(true, "Show Grid Zone Labels", group = G_BOT)
+bool showADXPeakMarkers = input.bool(true, "Show ADX Peak Markers", group = G_BOT)
+
+// #############################################################################
+// INPUTS — 📊 GRID · VISUALS
+// #############################################################################
+const string G_VIS = "📊 GRID · VISUALS"
+color gridFillColor      = input.color(color.new(color.teal, 90), "Grid Zone Fill", group = G_VIS)
+color startLineColor     = input.color(color.teal, "Start Line (Grid ON)", group = G_VIS)
+color endLineColor       = input.color(color.orange, "End Line (Grid OFF)", group = G_VIS)
+color adxPeakMarkerColor = input.color(#FDD835, "ADX Peak Marker", group = G_VIS)
+
+// #############################################################################
+// HELPERS
+// #############################################################################
+lineStyle(string s) =>
+    s == "Solid" ? line.style_solid : s == "Dashed" ? line.style_dashed : line.style_dotted
+
+textSize(string s) =>
+    s == "Tiny" ? size.tiny : s == "Small" ? size.small : s == "Normal" ? size.normal : size.large
+
+tablePos(string s) =>
+    s == "top_right" ? position.top_right : s == "top_left" ? position.top_left : s == "bottom_right" ? position.bottom_right : position.bottom_left
+
+pad2(int n) =>
+    n < 10 ? "0" + str.tostring(n) : str.tostring(n)
+
+fmtPrice(float v) =>
+    na(v) ? "n/a" : str.tostring(v, format.mintick)
+
+msg(string s) =>
+    "Sn1P3r: " + s + (appendDisclaimer ? DISCLAIMER : "")
+
+// 10-cell text bar, e.g. "████████░░" for 84 %
+usedBar(float pct) =>
+    float p      = na(pct) ? 0.0 : math.max(math.min(pct / 100, 1.0), 0.0)
+    int   filled = math.round(p * 10)
+    str.repeat("█", filled) + str.repeat("░", 10 - filled)
+
+// #############################################################################
+// DAILY DATA / ADR
+// Completed daily ranges come from the "D" feed with [1..10] offsets +
+// lookahead_on (no repaint). Today's open / high / low are tracked on the chart.
+// #############################################################################
+[adr, pr1, pr2, pr3, pr4, pr5, pr6, pr7, pr8, pr9, pr10] = request.security(syminfo.tickerid, "D", [ta.sma(high - low, adrDays)[1], (high - low)[1], (high - low)[2], (high - low)[3], (high - low)[4], (high - low)[5], (high - low)[6], (high - low)[7], (high - low)[8], (high - low)[9], (high - low)[10]], lookahead = barmerge.lookahead_on)
+
+bool newDay = timeframe.change("D")
+var float dayOpen = na
+var float dayHigh = na
+var float dayLow  = na
+if newDay or na(dayOpen)
+    dayOpen := open
+    dayHigh := high
+    dayLow  := low
+else
+    dayHigh := math.max(dayHigh, high)
+    dayLow  := math.min(dayLow, low)
+
+float todayMoved = dayHigh - dayLow
+float usedPct    = adr > 0 ? todayMoved / adr * 100 : na
+float leftToADR  = adr - todayMoved
+string adrName   = str.tostring(adrDays) + "ADR"
+
+// #############################################################################
+// WORKING HOURS (UTC+7)
+// #############################################################################
+string sessStr       = pad2(startHour) + pad2(startMin) + "-" + pad2(endHour) + pad2(endMin) + ":1234567"
+bool   inHours       = not enableWorkingHours or not na(time(timeframe.period, sessStr, "GMT+7"))
+int    nowMinOfDay   = hour(time, "GMT+7") * 60 + minute(time, "GMT+7")
+int    minsToClose   = (endHour * 60 + endMin - nowMinOfDay + 1440) % 1440
+bool   inFinalWindow = enableWorkingHours and inHours and minsToClose <= noNewGridFinalMin
+
+bgcolor(adxModuleOn and shadeOutsideHours and enableWorkingHours and not inHours ? offHoursShadeColor : na, title = "Off-hours shade")
+
+// #############################################################################
+// ADX — peak → flat detector
+// #############################################################################
+[diPlus, diMinus, adxVal] = ta.dmi(adxLength, adxSmoothing)
+bool adxCrossPeak = ta.crossover(adxVal, adxPeakLvl)
+bool adxFlat      = adxVal < adxFlatLvl
+
+var int  peakTime = na       // time of the last un-resolved ADX peak
+var bool adxReady = false    // peak has cooled to flat → sideways confirmed
+
+if adxCrossPeak
+    peakTime := time
+    adxReady := false
+else if not na(peakTime)
+    if adxFlat
+        adxReady := true
+        peakTime := na
+    else if time - peakTime > peakExpiryMin * 60000
+        peakTime := na
+if adxReady and not adxFlat
+    adxReady := false
+bool adxCooling = not na(peakTime)
+
+if adxModuleOn and showADXPeakMarkers and adxCrossPeak
+    label.new(bar_index, low, "⚡ " + str.tostring(adxVal, "#"), yloc = yloc.belowbar, style = label.style_triangleup, color = adxPeakMarkerColor, textcolor = color.blue, size = size.small)
+if adxModuleOn and alertADXPeakMsg and adxCrossPeak
+    alert(msg("ADX peak reached (" + str.tostring(adxVal, "0.0") + ")"), alert.freq_once_per_bar)
+
+// #############################################################################
+// GRID RULE (5ADR gate + danger)
+// Grid rule = ADR% threshold alone: ≥ Minimum % of 5ADR consumed → open.
+// #############################################################################
+bool gridGateOpen   = not gridRuleEnabled or (not na(usedPct) and usedPct >= minPctADRConsumed)
+bool dangerBreached = not na(usedPct) and usedPct >= dangerLevelPct
+bool adrGateOpened  = gridRuleEnabled and gridGateOpen and not gridGateOpen[1]
+
+if adxModuleOn and alertADRGate and adrGateOpened
+    alert(msg("ADR gate opened - grid may now activate"), alert.freq_once_per_bar)
+
+// #############################################################################
+// GRID ON / OFF STATE MACHINE
+// #############################################################################
+int   gridBars = math.min(math.max(math.round(gridWindowMin * 60.0 / timeframe.in_seconds()), 5), MAX_FUTURE_BARS)
+float gridHi   = ta.highest(high, gridBars)
+float gridLo   = ta.lowest(low, gridBars)
+
+var bool gridActive   = false
+var bool gridArmed    = true
+var int  gridOpenTime = na
+var box  gridBox      = na
+
+bool canOpenGrid = adxModuleOn and inHours and not inFinalWindow and gridGateOpen and not (closeGridIfTooFar and dangerBreached)
+bool gridOnEvt   = false
+bool gridOffEvt  = false
+
+if gridActive
+    bool byWindow = time - gridOpenTime >= gridWindowMin * 60000
+    bool byHours  = enableWorkingHours and not inHours
+    bool byDanger = closeGridIfTooFar and dangerBreached
+    bool byGate   = not gridGateOpen
+    if byWindow or byHours or byDanger or byGate or not adxModuleOn
+        gridActive := false
+        gridOffEvt := true
+        line.new(bar_index, low, bar_index, high, extend = extend.both, color = endLineColor, width = 2)
+        if not na(gridBox)
+            box.set_right(gridBox, bar_index)
+        if alertGridOff
+            string why = byWindow ? "grid window done" : byHours ? "session closed" : byDanger ? "danger level hit" : "ADR gate shut"
+            alert(msg("GRID OFF (" + why + ")"), alert.freq_once_per_bar)
+else
+    if not canOpenGrid
+        gridArmed := true
+    bool openTrigger = gridNeedsADX ? adxReady : gridArmed
+    if canOpenGrid and openTrigger
+        gridActive   := true
+        gridOnEvt    := true
+        gridArmed    := false
+        adxReady     := false
+        gridOpenTime := time
+        line.new(bar_index, low, bar_index, high, extend = extend.both, color = startLineColor, width = 2)
+        gridBox := box.new(bar_index, gridHi, bar_index + gridBars, gridLo, border_color = color.new(startLineColor, 40), bgcolor = gridFillColor)
+        if showGridZoneLabels
+            label.new(bar_index, gridHi, "GRID ZONE", style = label.style_label_down, color = color.new(chart.fg_color, 80), textcolor = chart.fg_color, size = size.small)
+        if alertGridOn
+            alert(msg("GRID ON · zone " + fmtPrice(gridLo) + " - " + fmtPrice(gridHi)), alert.freq_once_per_bar)
+
+// #############################################################################
+// SIDEWAYS DETECTION
+// #############################################################################
+float atrZ    = ta.atr(swAtrLen)
+float winHi   = ta.highest(high, swMinCandles)
+float winLo   = ta.lowest(low, swMinCandles)
+float winRng  = winHi - winLo
+float spanHi  = ta.highest(high, swMinCandles + swConfirm - 1)
+float spanLo  = ta.lowest(low, swMinCandles + swConfirm - 1)
+float volBase = ta.sma(volume, swVolBaseLen)
+float volWin  = ta.sma(volume, swMinCandles)
+
+bool condPct = winLo > 0 and winRng / winLo * 100 <= swMaxRangePct
+bool condAtr = not swUseAtr or winRng <= atrZ * swAtrMult
+bool condVol = not swUseVol or na(volBase) or volWin <= volBase * swVolMult
+bool isTight = winRng > 0 and condPct and condAtr and condVol
+
+var int tightStreak = 0
+tightStreak := isTight ? tightStreak + 1 : 0
+
+// breakout rule shared by the structure breakout and the outer-zone break
+beyond(float level, bool up) =>
+    switch boMethod
+        "Wick beyond"    => up ? high > level : low < level
+        "Percent beyond" => up ? close > level * (1 + boPct / 100) : close < level * (1 - boPct / 100)
+        "ATR beyond"     => up ? close > level + atrZ * boAtrMult : close < level - atrZ * boAtrMult
+        => up ? close > level : close < level
+
+// #############################################################################
+// ZONE / STRUCTURE DRAWING
+// #############################################################################
+zoneText(bool isBuy, int num, float top, float bottom) =>
+    string t = tzLabels ? (isBuy ? "BUY ZONE " : "SELL ZONE ") + str.tostring(num) : ""
+    if tzPrices
+        t := t + (t == "" ? "" : "\n") + fmtPrice(bottom) + " - " + fmtPrice(top)
+    t
+
+newZone(bool isBuy, int num, float top, float bottom, int left, int right) =>
+    color c = isBuy ? tzBuyCol : tzSellCol
+    box   b = na
+    if tzShow
+        b := box.new(left, top, right, bottom, border_color = c, border_width = 1, bgcolor = color.new(c, tzTransp), extend = fibExtend ? extend.right : extend.none, text = zoneText(isBuy, num, top, bottom), text_color = c, text_size = size.small, text_halign = text.align_right, text_valign = text.align_center)
+    Zone.new(top, bottom, num, isBuy, b)
+
+// stop an old structure where the next one starts
+method cutAt(Structure s, int x) =>
+    int xr = fibExtend ? x : math.min(x, s.confirmBar + fibExtBars)
+    if not na(s.hiLn)
+        line.set_x2(s.hiLn, xr)
+        line.set_extend(s.hiLn, extend.none)
+    if not na(s.loLn)
+        line.set_x2(s.loLn, xr)
+        line.set_extend(s.loLn, extend.none)
+    for z in s.buys
+        if not na(z.bx)
+            box.set_right(z.bx, xr)
+            box.set_extend(z.bx, extend.none)
+    for z in s.sells
+        if not na(z.bx)
+            box.set_right(z.bx, xr)
+            box.set_extend(z.bx, extend.none)
+    s
+
+method deleteAll(Structure s) =>
+    box.delete(s.swBox)
+    line.delete(s.hiLn)
+    line.delete(s.loLn)
+    for z in s.buys
+        box.delete(z.bx)
+    for z in s.sells
+        box.delete(z.bx)
+    s
+
+var array<Structure> structs = array.new<Structure>()
+var box potBox        = na
+var int upStreak      = 0
+var int dnStreak      = 0
+var int buyBrkStreak  = 0
+var int sellBrkStreak = 0
+
+bool swConfirmedEvt = false
+bool boUpEvt        = false
+bool boDnEvt        = false
+bool zoneTouchEvt   = false
+bool zoneAddEvt     = false
+
+if fibModuleOn
+    // ── new sideways structure ──────────────────────────────────────────────
+    Structure prev    = structs.size() > 0 ? structs.last() : na
+    int       winLeft = bar_index - swMinCandles - swConfirm + 2
+    bool      canNew  = na(prev) or (prev.state != 0 and winLeft > prev.confirmBar)
+    float     sRng    = spanHi - spanLo
+
+    if isTight and tightStreak >= swConfirm and canNew and sRng > 0
+        if not na(prev)
+            if histKeep
+                prev.cutAt(winLeft)
+            else
+                prev.deleteAll()
+                structs.pop()
+
+        int    xr  = bar_index + fibExtBars
+        string ext = fibExtend ? extend.right : extend.none
+        box  sb = swShowBox ? box.new(winLeft, spanHi, bar_index, spanLo, border_color = color.new(color.gray, 30), border_width = 1, bgcolor = swFillCol) : na
+        line hl = fibShow ? line.new(winLeft, spanHi, xr, spanHi, extend = ext, color = color.new(color.gray, 30), width = fibWidth) : na
+        line ll = fibShow ? line.new(winLeft, spanLo, xr, spanLo, extend = ext, color = color.new(color.gray, 30), width = fibWidth) : na
+
+        Structure s = Structure.new(winLeft, bar_index, spanHi, spanLo, sb, hl, ll, array.new<Zone>(), array.new<Zone>())
+        for k = 1 to INIT_ZONES_SIDE
+            float bTop = spanHi - tzSpacing * k * sRng
+            s.buys.push(newZone(true, 2 * k - 1, bTop, bTop - tzHeight * sRng, winLeft, xr))
+            float sBot = spanHi + tzSpacing * k * sRng
+            s.sells.push(newZone(false, 2 * k, sBot + tzHeight * sRng, sBot, winLeft, xr))
+        structs.push(s)
+
+        int keep = histKeep ? histMax + 1 : 1
+        while structs.size() > keep
+            structs.shift().deleteAll()
+
+        upStreak       := 0
+        dnStreak       := 0
+        buyBrkStreak   := 0
+        sellBrkStreak  := 0
+        swConfirmedEvt := true
+
+    // ── potential (unconfirmed) zone preview ────────────────────────────────
+    box.delete(potBox)
+    potBox := na
+    if swShowPotential and isTight and tightStreak < swConfirm and canNew
+        potBox := box.new(bar_index - swMinCandles + 1, winHi, bar_index, winLo, border_color = color.gray, border_style = line.style_dashed, bgcolor = color.new(color.gray, 94))
+
+    // ── current structure: breakout, outer-zone breaks, zone touches ────────
+    Structure cur = structs.size() > 0 ? structs.last() : na
+    if not na(cur) and bar_index > cur.confirmBar
+        if cur.state == 0
+            upStreak := beyond(cur.top, true) ? upStreak + 1 : 0
+            dnStreak := beyond(cur.bottom, false) ? dnStreak + 1 : 0
+            if upStreak >= boConfirm
+                cur.state := 1
+                boUpEvt   := true
+                if boMark
+                    label.new(bar_index, low, "▲ BREAKOUT", yloc = yloc.belowbar, style = label.style_label_up, color = color.orange, textcolor = color.white, size = size.tiny)
+            else if dnStreak >= boConfirm
+                cur.state := -1
+                boDnEvt   := true
+                if boMark
+                    label.new(bar_index, high, "▼ BREAKDOWN", yloc = yloc.abovebar, style = label.style_label_down, color = color.orange, textcolor = color.white, size = size.tiny)
+
+        float cRng      = cur.top - cur.bottom
+        int   zoneLeft  = math.max(cur.left, bar_index - MAX_PAST_BARS)
+        int   zoneRight = math.max(cur.confirmBar + fibExtBars, zoneLeft)
+        Zone  outBuy    = cur.buys.last()
+        Zone  outSell   = cur.sells.last()
+        buyBrkStreak  := beyond(outBuy.bottom, false) ? buyBrkStreak + 1 : 0
+        sellBrkStreak := beyond(outSell.top, true) ? sellBrkStreak + 1 : 0
+
+        if tzAutoAdd and buyBrkStreak >= boConfirm and cur.addedBuys < tzMaxAdded
+            float nTop = outBuy.top - tzSpacing * cRng
+            Zone  nz   = newZone(true, outBuy.num + 2, nTop, nTop - tzHeight * cRng, zoneLeft, zoneRight)
+            cur.buys.push(nz)
+            cur.addedBuys := cur.addedBuys + 1
+            buyBrkStreak  := 0
+            zoneAddEvt    := true
+            if boMark
+                label.new(bar_index, low, "▼ ZONE BREAK", yloc = yloc.belowbar, style = label.style_label_up, color = color.orange, textcolor = color.white, size = size.tiny)
+            if alZoneBreak
+                alert(msg("Outer BUY zone broken - BUY ZONE " + str.tostring(nz.num) + " added (" + fmtPrice(nz.bottom) + " - " + fmtPrice(nz.top) + ")"), alert.freq_once_per_bar_close)
+
+        if tzAutoAdd and sellBrkStreak >= boConfirm and cur.addedSells < tzMaxAdded
+            float nBot = outSell.bottom + tzSpacing * cRng
+            Zone  nz   = newZone(false, outSell.num + 2, nBot + tzHeight * cRng, nBot, zoneLeft, zoneRight)
+            cur.sells.push(nz)
+            cur.addedSells := cur.addedSells + 1
+            sellBrkStreak  := 0
+            zoneAddEvt     := true
+            if boMark
+                label.new(bar_index, high, "▲ ZONE BREAK", yloc = yloc.abovebar, style = label.style_label_down, color = color.orange, textcolor = color.white, size = size.tiny)
+            if alZoneBreak
+                alert(msg("Outer SELL zone broken - SELL ZONE " + str.tostring(nz.num) + " added (" + fmtPrice(nz.bottom) + " - " + fmtPrice(nz.top) + ")"), alert.freq_once_per_bar_close)
+
+        // zone touch → scalp check
+        bool   touchBuy  = false
+        bool   touchSell = false
+        string touchName = ""
+        for z in cur.buys
+            bool isIn = low <= z.top and high >= z.bottom
+            if isIn and not z.wasIn
+                touchBuy  := true
+                touchName := "BUY ZONE " + str.tostring(z.num)
+            z.wasIn := isIn
+        for z in cur.sells
+            bool isIn = low <= z.top and high >= z.bottom
+            if isIn and not z.wasIn
+                touchSell := true
+                touchName := "SELL ZONE " + str.tostring(z.num)
+            z.wasIn := isIn
+
+        if touchBuy or touchSell
+            zoneTouchEvt := true
+            bool scalpOk = adxFlat and not na(usedPct) and usedPct >= minPctADRConsumed
+            if tzScalpCheck and scalpOk
+                label.new(bar_index, touchBuy ? low : high, "SCALP OK", yloc = touchBuy ? yloc.belowbar : yloc.abovebar, style = touchBuy ? label.style_label_up : label.style_label_down, color = color.new(color.lime, 20), textcolor = color.black, size = size.tiny)
+            if alZoneTouch
+                alert(msg("Price touched " + touchName + (tzScalpCheck ? " - scalp " + (scalpOk ? "OK" : "not confirmed") : "")), alert.freq_once_per_bar)
+
+// #############################################################################
+// ADR REFERENCE LINES (5ADR +/- and 1/3 ADR +/-) + DAY ANCHOR
+// Drawn from the day's first bar to the last bar + Line / Label Offset.
+// #############################################################################
+var array<line>  adrLns      = array.new<line>()
+var array<label> adrLbls     = array.new<label>()
+var line         dayAnchorLn = na
+
+addAdrLevel(float y, string txt, color c, string st) =>
+    int x2 = bar_index + lineLabelOffset
+    adrLns.push(line.new(bar_index, y, x2, y, color = c, style = st, width = 1))
+    adrLbls.push(label.new(x2, y, txt, style = label.style_label_left, color = color.new(color.black, 100), textcolor = c, size = size.small))
+
+bool adrOn = adxModuleOn and enableADR
+if adrOn and newDay and not na(adr)
+    for ln in adrLns
+        if keepHistoricalADR
+            line.set_x2(ln, bar_index - 1)
+        else
+            line.delete(ln)
+    for lb in adrLbls
+        label.delete(lb)
+    adrLns.clear()
+    adrLbls.clear()
+
+    color c5  = autoColourLines ? chart.fg_color : color5ADR
+    color c13 = autoColourLines ? chart.fg_color : color13ADR
+    if show5ADRLines
+        addAdrLevel(dayOpen + adr, adrName + "+", c5, lineStyle(style5ADRStr))
+        addAdrLevel(dayOpen - adr, adrName + "−", c5, lineStyle(style5ADRStr))
+    if show13ADRLines
+        addAdrLevel(dayOpen + adr / 3, "1/3ADR+", c13, lineStyle(style13ADRStr))
+        addAdrLevel(dayOpen - adr / 3, "1/3ADR−", c13, lineStyle(style13ADRStr))
+    if showDayAnchor
+        if not keepHistoricalADR
+            line.delete(dayAnchorLn)
+        dayAnchorLn := line.new(bar_index, low, bar_index, high, extend = extend.both, color = autoColourLines ? chart.fg_color : colorDayAnchor, style = lineStyle(styleDayAnchorStr))
+
+if adrOn and adrLns.size() > 0
+    int x2 = bar_index + lineLabelOffset
+    for ln in adrLns
+        line.set_x2(ln, x2)
+    for lb in adrLbls
+        label.set_x(lb, x2)
+
+// #############################################################################
+// RANGE DASHBOARD
+// Sn1P3r SWZ · ADX · Session · 5ADR · Today moved · Used · Left to ADR ·
+// Grid rule · Read
+// #############################################################################
+dashRow(table t, int row, string key, string val, color keyBg, color valBg, color valTx, string ts) =>
+    table.cell(t, 0, row, key, text_color = chart.fg_color, text_size = ts, bgcolor = keyBg)
+    table.cell(t, 1, row, val, text_color = valTx, text_size = ts, bgcolor = valBg)
+
+var table dash = table.new(tablePos(dashPositionStr), 2, 9, border_color = color.new(color.black, 100), border_width = 1)
+
+if barstate.islast and adxModuleOn and showDashboard
+    string ts     = textSize(dashTextSizeStr)
+    color  fg     = chart.fg_color
+    color  rowBg  = color.new(color.gray, 88)
+    color  okBg   = color.new(color.green, 44)
+    color  warnBg = color.new(color.orange, 44)
+    color  badBg  = color.new(color.red, 44)
+    string pctTxt = na(usedPct) ? "n/a" : str.tostring(usedPct, "0.0") + "%"
+
+    string statusTxt = gridActive ? "🟢 GRID ON" : enableWorkingHours and not inHours ? "💤 Idle" : dangerBreached ? "⛔ Danger" : adxVal >= adxPeakLvl ? "⚡ Trending" : adxCooling ? "⏳ Cooling" : gridNeedsADX and adxReady ? "🟡 Ready" : "💤 Idle"
+    table.cell(dash, 0, 0, "Sn1P3r SWZ", text_color = fg, text_size = ts, bgcolor = color.new(color.gray, 80))
+    table.cell(dash, 1, 0, statusTxt, text_color = color.white, text_size = ts, bgcolor = color.new(color.gray, 60))
+
+    dashRow(dash, 1, "ADX", str.tostring(adxVal, "0.0") + "  (peak " + str.tostring(adxPeakLvl, "#.#") + " / flat " + str.tostring(adxFlatLvl, "#.#") + ")", rowBg, rowBg, fg, ts)
+
+    string sessTxt = not enableWorkingHours ? "24h (filter off)" : not inHours ? "Closed" : inFinalWindow ? "Open · final " + str.tostring(minsToClose) + "m" : "Open"
+    color  sessBg  = not enableWorkingHours ? rowBg : not inHours ? color.new(color.gray, 70) : inFinalWindow ? warnBg : okBg
+    dashRow(dash, 2, "Session", sessTxt, rowBg, sessBg, enableWorkingHours and inHours ? color.white : fg, ts)
+
+    dashRow(dash, 3, adrName, fmtPrice(adr), rowBg, rowBg, fg, ts)
+    dashRow(dash, 4, "Today moved", fmtPrice(todayMoved), rowBg, rowBg, fg, ts)
+
+    color levelBg = dangerBreached ? badBg : gridGateOpen ? okBg : warnBg
+    dashRow(dash, 5, "Used", na(usedPct) ? "n/a" : usedBar(usedPct) + " " + pctTxt, rowBg, levelBg, color.white, ts)
+    dashRow(dash, 6, "Left to ADR", fmtPrice(leftToADR), rowBg, rowBg, fg, ts)
+
+    // Grid rule: ≥ Minimum % of 5ADR consumed → open, below it → shut. Nothing else feeds this line.
+    string minTxt   = str.tostring(minPctADRConsumed, "#.#") + "%"
+    string ruleTxt  = not gridRuleEnabled ? "⚪ rule off · " + pctTxt : gridGateOpen ? "✅ open · " + pctTxt + " ≥ " + minTxt : "❌ shut · " + pctTxt + " < " + minTxt
+    color  ruleBg   = not gridRuleEnabled ? rowBg : gridGateOpen ? color.new(color.teal, 35) : badBg
+    dashRow(dash, 7, "Grid rule", ruleTxt, rowBg, ruleBg, gridRuleEnabled ? color.white : fg, ts)
+
+    string readTxt = dangerBreached ? "Danger · range overextended" : gridGateOpen ? "Range spent · grid-friendly" : "Range available · wait for ADR"
+    dashRow(dash, 8, "Read", readTxt, rowBg, levelBg, color.white, ts)
+
+// #############################################################################
+// PREVIOUS DAILY RANGES (bottom centre): Day -1 … Day -N | 5ADR = x
+// #############################################################################
+var table rangesTbl = table.new(position.bottom_center, MAX_RANGE_CELLS + 1, 1, frame_color = #DBDBDB, frame_width = 1, border_color = #3D3D3D, border_width = 1)
+
+if barstate.islast and adxModuleOn and showPrevRangesTbl
+    string        ts = textSize(dashTextSizeStr)
+    array<float>  pr = array.from(pr1, pr2, pr3, pr4, pr5, pr6, pr7, pr8, pr9, pr10)
+    int           n  = math.min(adrDays, MAX_RANGE_CELLS)
+    for i = 0 to n - 1
+        table.cell(rangesTbl, i, 0, fmtPrice(pr.get(i)), text_color = #DBDBDB, text_size = ts, bgcolor = color.black, tooltip = "Day -" + str.tostring(i + 1) + " range")
+    table.cell(rangesTbl, n, 0, adrName + " = " + fmtPrice(adr), text_color = color.black, text_size = ts, bgcolor = #DBDBDB)
+
+// #############################################################################
+// ALERT CONDITIONS (Create Alert → Condition: Sn1P3r S&Z → pick one)
+// Or choose "Any alert() function call" for the Alert() toggles in the settings.
+// #############################################################################
+alertcondition(gridOnEvt, "GRID ON", "Sn1P3r: GRID ON on {{ticker}}")
+alertcondition(gridOffEvt, "GRID OFF", "Sn1P3r: GRID OFF on {{ticker}}")
+alertcondition(adxModuleOn and adrGateOpened, "ADR gate opened", "Sn1P3r: ADR gate opened on {{ticker}}")
+alertcondition(adxModuleOn and adxCrossPeak, "ADX peak", "Sn1P3r: ADX peak on {{ticker}}")
+alertcondition(swConfirmedEvt, "Sideways zone confirmed", "Sn1P3r: new sideways zone confirmed on {{ticker}}")
+alertcondition(boUpEvt or boDnEvt, "Sideways breakout", "Sn1P3r: sideways zone broken on {{ticker}}")
+alertcondition(zoneTouchEvt, "Zone touched", "Sn1P3r: price touched a trading zone on {{ticker}}")
+alertcondition(zoneAddEvt, "Outer zone broken", "Sn1P3r: outer zone broken, new zone added on {{ticker}}")
