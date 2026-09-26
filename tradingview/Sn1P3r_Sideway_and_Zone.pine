@@ -34,6 +34,7 @@ type Zone
 type Structure
     int         left
     int         confirmBar
+    int         endBar                 // last bar of the box (breakout bar once broken)
     float       top
     float       bottom
     box         swBox
@@ -93,7 +94,7 @@ bool   boMark    = input.bool(false, "Mark breakouts on chart", group = G_BO)
 // #############################################################################
 const string G_FIB = "📐 ZONE · FIBONACCI"
 bool fibShow    = input.bool(true, "Show Fib levels", group = G_FIB)
-int  fibWidth   = input.int(1, "Fib line width", minval = 1, maxval = 4, group = G_FIB, tooltip = "Width of the structure levels drawn at the sideways zone high (0) and low (1).")
+int  fibWidth   = input.int(1, "Fib line width", minval = 1, maxval = 4, group = G_FIB, tooltip = "Thickness of the structure levels drawn at the sideways zone high (0) and low (1). 1 = the standard thick grey line.")
 bool fibExtend  = input.bool(true, "Extend current structure right", group = G_FIB, tooltip = "ON: the newest structure's levels and trading zones run to the right edge of the chart. Older structures always stop where the next structure starts.")
 int  fibExtBars = input.int(40, "Fixed extension (bars)", minval = 1, maxval = MAX_FUTURE_BARS, group = G_FIB, tooltip = "Bars the current structure is projected past its confirmation candle. It is the full length when 'Extend current structure right' is OFF, and the anchor of the zone text when it is ON.")
 
@@ -111,7 +112,7 @@ bool  tzAutoAdd    = input.bool(true, "Auto-add next zone when the outermost is 
 float tzSpacing    = input.float(2.0, "Zone spacing (× range)", minval = 0.1, step = 0.1, group = G_TZ)
 float tzHeight     = input.float(0.5, "Added-zone height (× range)", minval = 0.05, step = 0.05, group = G_TZ)
 int   tzMaxAdded   = input.int(6, "Max added zones per side", minval = 0, group = G_TZ)
-bool  tzScalpCheck = input.bool(true, "Scalp check on zone touch (ADX flat + ADR spent)", group = G_TZ, tooltip = "When price enters a zone: ADX below the flat level AND the day's range at or above 'Minimum % of 5ADR consumed' → a small SCALP OK marker. The zone-touch alert reports the result either way.")
+bool  tzScalpCheck = input.bool(true, "Scalp check on zone touch (ADX flat + ADR spent)", group = G_TZ, tooltip = "When price enters a zone during working hours with ADX below the flat level AND the day's range at or above 'Minimum % of 5ADR consumed' → a small SCALP OK marker. The zone-touch alert reports the result either way.")
 
 // #############################################################################
 // INPUTS — 📐 ZONE · HISTORY
@@ -244,15 +245,22 @@ usedBar(float pct) =>
 
 // #############################################################################
 // DAILY DATA / ADR
-// Completed daily ranges come from the "D" feed with [1..10] offsets +
-// lookahead_on (no repaint). Today's open / high / low are tracked on the chart.
+// Completed daily ranges are recorded from the chart's own bars (the partial
+// first day is skipped). ADR = average of the last "ADR Days" recorded ranges,
+// or of fewer when the chart history holds fewer days (e.g. on 1m charts).
 // #############################################################################
-[adr, pr1, pr2, pr3, pr4, pr5, pr6, pr7, pr8, pr9, pr10] = request.security(syminfo.tickerid, "D", [ta.sma(high - low, adrDays)[1], (high - low)[1], (high - low)[2], (high - low)[3], (high - low)[4], (high - low)[5], (high - low)[6], (high - low)[7], (high - low)[8], (high - low)[9], (high - low)[10]], lookahead = barmerge.lookahead_on)
-
 bool newDay = timeframe.change("D")
+var array<float> pastRanges = array.new<float>()   // most recent first
+var bool  dayFull = false
 var float dayOpen = na
 var float dayHigh = na
 var float dayLow  = na
+if newDay and bar_index > 0
+    if dayFull
+        pastRanges.unshift(dayHigh - dayLow)
+        if pastRanges.size() > math.max(adrDays, MAX_RANGE_CELLS)
+            pastRanges.pop()
+    dayFull := true
 if newDay or na(dayOpen)
     dayOpen := open
     dayHigh := high
@@ -261,6 +269,8 @@ else
     dayHigh := math.max(dayHigh, high)
     dayLow  := math.min(dayLow, low)
 
+int   adrCount   = math.min(adrDays, pastRanges.size())
+float adr        = adrCount > 0 ? pastRanges.slice(0, adrCount).avg() : na
 float todayMoved = dayHigh - dayLow
 float usedPct    = adr > 0 ? todayMoved / adr * 100 : na
 float leftToADR  = adr - todayMoved
@@ -300,9 +310,12 @@ if adxReady and not adxFlat
     adxReady := false
 bool adxCooling = not na(peakTime)
 
-if adxModuleOn and showADXPeakMarkers and adxCrossPeak
-    label.new(bar_index, low, "⚡ " + str.tostring(adxVal, "#"), yloc = yloc.belowbar, style = label.style_triangleup, color = adxPeakMarkerColor, textcolor = color.blue, size = size.small)
-if adxModuleOn and alertADXPeakMsg and adxCrossPeak
+// markers and alerts only inside working hours
+bool adxPeakEvt  = adxCrossPeak and inHours
+bool adxPeakMark = adxModuleOn and showADXPeakMarkers and adxPeakEvt
+plotshape(adxPeakMark and adxPeakLvl == 50, "ADX peak", shape.triangleup, location.belowbar, adxPeakMarkerColor, text = "⚡ 50", textcolor = color.blue, size = size.small, display = display.pane)
+plotshape(adxPeakMark and adxPeakLvl != 50, "ADX peak (custom level)", shape.triangleup, location.belowbar, adxPeakMarkerColor, text = "⚡ ADX", textcolor = color.blue, size = size.small, display = display.pane)
+if adxModuleOn and alertADXPeakMsg and adxPeakEvt
     alert(msg("ADX peak reached (" + str.tostring(adxVal, "0.0") + ")"), alert.freq_once_per_bar)
 
 // #############################################################################
@@ -400,12 +413,48 @@ zoneText(bool isBuy, int num, float top, float bottom) =>
         t := t + (t == "" ? "" : "\n") + fmtPrice(bottom) + " - " + fmtPrice(top)
     t
 
-newZone(bool isBuy, int num, float top, float bottom, int left, int right) =>
-    color c = isBuy ? tzBuyCol : tzSellCol
-    box   b = na
+// k-th zone (1-based) of one side, measured from the structure high
+zoneLevels(float sTop, float sRng, bool isBuy, int k) =>
+    float edge   = isBuy ? sTop - tzSpacing * k * sRng : sTop + tzSpacing * k * sRng
+    float top    = isBuy ? edge : edge + tzHeight * sRng
+    float bottom = isBuy ? edge - tzHeight * sRng : edge
+    [top, bottom]
+
+newZone(bool isBuy, int k, float sTop, float sRng, int left, int right) =>
+    [top, bottom] = zoneLevels(sTop, sRng, isBuy, k)
+    int   num = isBuy ? 2 * k - 1 : 2 * k
+    color c   = isBuy ? tzBuyCol : tzSellCol
+    box   b   = na
     if tzShow
         b := box.new(left, top, right, bottom, border_color = c, border_width = 1, bgcolor = color.new(c, tzTransp), extend = fibExtend ? extend.right : extend.none, text = zoneText(isBuy, num, top, bottom), text_color = c, text_size = size.small, text_halign = text.align_right, text_valign = text.align_center)
     Zone.new(top, bottom, num, isBuy, b)
+
+method relayoutSide(array<Zone> zones, float sTop, float sRng, bool isBuy) =>
+    for [i, z] in zones
+        [t, b] = zoneLevels(sTop, sRng, isBuy, i + 1)
+        z.top    := t
+        z.bottom := b
+        if not na(z.bx)
+            box.set_top(z.bx, t)
+            box.set_bottom(z.bx, b)
+            box.set_text(z.bx, zoneText(isBuy, z.num, t, b))
+    zones
+
+// structure high / low changed while still sideways → move box, levels and zones
+method relayout(Structure s) =>
+    float r = s.top - s.bottom
+    s.buys.relayoutSide(s.top, r, true)
+    s.sells.relayoutSide(s.top, r, false)
+    if not na(s.swBox)
+        box.set_top(s.swBox, s.top)
+        box.set_bottom(s.swBox, s.bottom)
+    if not na(s.hiLn)
+        line.set_y1(s.hiLn, s.top)
+        line.set_y2(s.hiLn, s.top)
+    if not na(s.loLn)
+        line.set_y1(s.loLn, s.bottom)
+        line.set_y2(s.loLn, s.bottom)
+    s
 
 // stop an old structure where the next one starts
 method cutAt(Structure s, int x) =>
@@ -453,7 +502,7 @@ if fibModuleOn
     // ── new sideways structure ──────────────────────────────────────────────
     Structure prev    = structs.size() > 0 ? structs.last() : na
     int       winLeft = bar_index - swMinCandles - swConfirm + 2
-    bool      canNew  = na(prev) or (prev.state != 0 and winLeft > prev.confirmBar)
+    bool      canNew  = na(prev) or (prev.state != 0 and winLeft > prev.endBar)
     float     sRng    = spanHi - spanLo
 
     if isTight and tightStreak >= swConfirm and canNew and sRng > 0
@@ -467,15 +516,13 @@ if fibModuleOn
         int    xr  = bar_index + fibExtBars
         string ext = fibExtend ? extend.right : extend.none
         box  sb = swShowBox ? box.new(winLeft, spanHi, bar_index, spanLo, border_color = color.new(color.gray, 30), border_width = 1, bgcolor = swFillCol) : na
-        line hl = fibShow ? line.new(winLeft, spanHi, xr, spanHi, extend = ext, color = color.new(color.gray, 30), width = fibWidth) : na
-        line ll = fibShow ? line.new(winLeft, spanLo, xr, spanLo, extend = ext, color = color.new(color.gray, 30), width = fibWidth) : na
+        line hl = fibShow ? line.new(winLeft, spanHi, xr, spanHi, extend = ext, color = color.new(color.gray, 30), width = fibWidth + 1) : na
+        line ll = fibShow ? line.new(winLeft, spanLo, xr, spanLo, extend = ext, color = color.new(color.gray, 30), width = fibWidth + 1) : na
 
-        Structure s = Structure.new(winLeft, bar_index, spanHi, spanLo, sb, hl, ll, array.new<Zone>(), array.new<Zone>())
+        Structure s = Structure.new(left = winLeft, confirmBar = bar_index, endBar = bar_index, top = spanHi, bottom = spanLo, swBox = sb, hiLn = hl, loLn = ll, buys = array.new<Zone>(), sells = array.new<Zone>())
         for k = 1 to INIT_ZONES_SIDE
-            float bTop = spanHi - tzSpacing * k * sRng
-            s.buys.push(newZone(true, 2 * k - 1, bTop, bTop - tzHeight * sRng, winLeft, xr))
-            float sBot = spanHi + tzSpacing * k * sRng
-            s.sells.push(newZone(false, 2 * k, sBot + tzHeight * sRng, sBot, winLeft, xr))
+            s.buys.push(newZone(true, k, spanHi, sRng, winLeft, xr))
+            s.sells.push(newZone(false, k, spanHi, sRng, winLeft, xr))
         structs.push(s)
 
         int keep = histKeep ? histMax + 1 : 1
@@ -498,6 +545,10 @@ if fibModuleOn
     Structure cur = structs.size() > 0 ? structs.last() : na
     if not na(cur) and bar_index > cur.confirmBar
         if cur.state == 0
+            // box keeps growing until the breakout is confirmed
+            cur.endBar := bar_index
+            if not na(cur.swBox)
+                box.set_right(cur.swBox, bar_index)
             upStreak := beyond(cur.top, true) ? upStreak + 1 : 0
             dnStreak := beyond(cur.bottom, false) ? dnStreak + 1 : 0
             if upStreak >= boConfirm
@@ -510,6 +561,11 @@ if fibModuleOn
                 boDnEvt   := true
                 if boMark
                     label.new(bar_index, high, "▼ BREAKDOWN", yloc = yloc.abovebar, style = label.style_label_down, color = color.orange, textcolor = color.white, size = size.tiny)
+            // a wick outside the range without a (pending) break widens the structure
+            if cur.state == 0 and upStreak == 0 and dnStreak == 0 and (high > cur.top or low < cur.bottom)
+                cur.top    := math.max(cur.top, high)
+                cur.bottom := math.min(cur.bottom, low)
+                cur.relayout()
 
         float cRng      = cur.top - cur.bottom
         int   zoneLeft  = math.max(cur.left, bar_index - MAX_PAST_BARS)
@@ -520,8 +576,7 @@ if fibModuleOn
         sellBrkStreak := beyond(outSell.top, true) ? sellBrkStreak + 1 : 0
 
         if tzAutoAdd and buyBrkStreak >= boConfirm and cur.addedBuys < tzMaxAdded
-            float nTop = outBuy.top - tzSpacing * cRng
-            Zone  nz   = newZone(true, outBuy.num + 2, nTop, nTop - tzHeight * cRng, zoneLeft, zoneRight)
+            Zone  nz   = newZone(true, cur.buys.size() + 1, cur.top, cRng, zoneLeft, zoneRight)
             cur.buys.push(nz)
             cur.addedBuys := cur.addedBuys + 1
             buyBrkStreak  := 0
@@ -532,8 +587,7 @@ if fibModuleOn
                 alert(msg("Outer BUY zone broken - BUY ZONE " + str.tostring(nz.num) + " added (" + fmtPrice(nz.bottom) + " - " + fmtPrice(nz.top) + ")"), alert.freq_once_per_bar_close)
 
         if tzAutoAdd and sellBrkStreak >= boConfirm and cur.addedSells < tzMaxAdded
-            float nBot = outSell.bottom + tzSpacing * cRng
-            Zone  nz   = newZone(false, outSell.num + 2, nBot + tzHeight * cRng, nBot, zoneLeft, zoneRight)
+            Zone  nz   = newZone(false, cur.sells.size() + 1, cur.top, cRng, zoneLeft, zoneRight)
             cur.sells.push(nz)
             cur.addedSells := cur.addedSells + 1
             sellBrkStreak  := 0
@@ -562,7 +616,7 @@ if fibModuleOn
 
         if touchBuy or touchSell
             zoneTouchEvt := true
-            bool scalpOk = adxFlat and not na(usedPct) and usedPct >= minPctADRConsumed
+            bool scalpOk = inHours and adxFlat and not na(usedPct) and usedPct >= minPctADRConsumed
             if tzScalpCheck and scalpOk
                 label.new(bar_index, touchBuy ? low : high, "SCALP OK", yloc = touchBuy ? yloc.belowbar : yloc.abovebar, style = touchBuy ? label.style_label_up : label.style_label_down, color = color.new(color.lime, 20), textcolor = color.black, size = size.tiny)
             if alZoneTouch
@@ -661,15 +715,16 @@ if barstate.islast and adxModuleOn and showDashboard
 
 // #############################################################################
 // PREVIOUS DAILY RANGES (bottom centre): Day -1 … Day -N | 5ADR = x
+// Missing days (short chart history) show "—".
 // #############################################################################
 var table rangesTbl = table.new(position.bottom_center, MAX_RANGE_CELLS + 1, 1, frame_color = #DBDBDB, frame_width = 1, border_color = #3D3D3D, border_width = 1)
 
 if barstate.islast and adxModuleOn and showPrevRangesTbl
     string        ts = textSize(dashTextSizeStr)
-    array<float>  pr = array.from(pr1, pr2, pr3, pr4, pr5, pr6, pr7, pr8, pr9, pr10)
     int           n  = math.min(adrDays, MAX_RANGE_CELLS)
     for i = 0 to n - 1
-        table.cell(rangesTbl, i, 0, fmtPrice(pr.get(i)), text_color = #DBDBDB, text_size = ts, bgcolor = color.black, tooltip = "Day -" + str.tostring(i + 1) + " range")
+        string v = i < pastRanges.size() ? fmtPrice(pastRanges.get(i)) : "—"
+        table.cell(rangesTbl, i, 0, v, text_color = #DBDBDB, text_size = ts, bgcolor = color.black, tooltip = "Day -" + str.tostring(i + 1) + " range")
     table.cell(rangesTbl, n, 0, adrName + " = " + fmtPrice(adr), text_color = color.black, text_size = ts, bgcolor = #DBDBDB)
 
 // #############################################################################
@@ -679,7 +734,7 @@ if barstate.islast and adxModuleOn and showPrevRangesTbl
 alertcondition(gridOnEvt, "GRID ON", "Sn1P3r: GRID ON on {{ticker}}")
 alertcondition(gridOffEvt, "GRID OFF", "Sn1P3r: GRID OFF on {{ticker}}")
 alertcondition(adxModuleOn and adrGateOpened, "ADR gate opened", "Sn1P3r: ADR gate opened on {{ticker}}")
-alertcondition(adxModuleOn and adxCrossPeak, "ADX peak", "Sn1P3r: ADX peak on {{ticker}}")
+alertcondition(adxModuleOn and adxPeakEvt, "ADX peak", "Sn1P3r: ADX peak on {{ticker}}")
 alertcondition(swConfirmedEvt, "Sideways zone confirmed", "Sn1P3r: new sideways zone confirmed on {{ticker}}")
 alertcondition(boUpEvt or boDnEvt, "Sideways breakout", "Sn1P3r: sideways zone broken on {{ticker}}")
 alertcondition(zoneTouchEvt, "Zone touched", "Sn1P3r: price touched a trading zone on {{ticker}}")

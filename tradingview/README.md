@@ -13,12 +13,13 @@ File: [`Sn1P3r_Sideway_and_Zone.pine`](Sn1P3r_Sideway_and_Zone.pine)
 
 | Element | What it is |
 |---|---|
-| Grey box + 2 grey lines | Confirmed sideways structure (the box) and its high and low levels. The latest structure extends right, and older ones stop where the next one starts. |
+| Grey box + 2 grey lines | Confirmed sideways structure and its high/low levels. The box keeps growing until price breaks out. A wick outside the range without a confirmed break widens it, and the zones move with it. The latest structure extends right, and older ones stop where the next one starts. A new structure can only start after the previous one has broken out. |
 | `BUY ZONE n` / `SELL ZONE n` | Trading-zone ladder built from the structure (see the formula below). |
-| Yellow ▲ `⚡ 50` | ADX crossed the peak level (the number is the ADX value). |
+| Yellow ▲ `⚡ 50` | ADX crossed the peak level during working hours. |
+| `SCALP OK` | Zone touched during working hours, with ADX flat and ADR spent. |
 | `1/3ADR±`, `5ADR±` | Day open ± ADR/3 and ± ADR, drawn from the day start to the last bar + offset. |
 | Top-right table | Status, ADX, Session, 5ADR, Today moved, Used (bar), Left to ADR, Grid rule, Read. |
-| Bottom-centre table | Previous daily ranges (Day -1 on the left; hover a cell to see which day), then `5ADR = …`. |
+| Bottom-centre table | Previous daily ranges (Day -1 on the left; hover a cell to see which day), then `5ADR = …`. The ranges are recorded from the chart's own bars. If the history is short (e.g. 1m), missing days show `—` and the ADR averages the days available. |
 | Teal and orange vertical lines, `GRID ZONE` | GRID ON and GRID OFF, with the planned grid window as a box. |
 | Grey background | Outside working hours (06:00–17:00 UTC+7). |
 
@@ -33,7 +34,8 @@ With the defaults (S = 2, H = 0.5), BUY 1 is 1R under the low, SELL 2 is 2R over
 BUY 3 is 3R under the low and SELL 4 is 4R over the high. When price confirms a break beyond the
 outermost zone of a side, the next zone is added one spacing further out (BUY 5, SELL 6, …).
 
-Checked against the reference screenshot: all 9 visible zone labels match exactly.
+Checked against the original indicator on XAUUSD 5m and 1m: all 76 zone prices are identical,
+including the auto-added BUY ZONE 5/7/9/11 and the last digit on half-tick values.
 For example, with high 4281.970 and low 4271.135 (R = 10.835), the ladder gives
 BUY ZONE 1 = 4254.883 - 4260.300, SELL ZONE 2 = 4303.640 - 4309.058 and
 SELL ZONE 4 = 4325.310 - 4330.728.
