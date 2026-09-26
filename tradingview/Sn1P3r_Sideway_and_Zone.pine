@@ -245,22 +245,19 @@ usedBar(float pct) =>
 
 // #############################################################################
 // DAILY DATA / ADR
-// Completed daily ranges are recorded from the chart's own bars (the partial
-// first day is skipped). ADR = average of the last "ADR Days" recorded ranges,
-// or of fewer when the chart history holds fewer days (e.g. on 1m charts).
+// Completed daily ranges are recorded from the chart's own bars, including the
+// first day of the chart history. ADR = average of the last "ADR Days" recorded
+// ranges, or of fewer when the chart history holds fewer days (e.g. on 1m).
 // #############################################################################
 bool newDay = timeframe.change("D")
 var array<float> pastRanges = array.new<float>()   // most recent first
-var bool  dayFull = false
 var float dayOpen = na
 var float dayHigh = na
 var float dayLow  = na
-if newDay and bar_index > 0
-    if dayFull
-        pastRanges.unshift(dayHigh - dayLow)
-        if pastRanges.size() > math.max(adrDays, MAX_RANGE_CELLS)
-            pastRanges.pop()
-    dayFull := true
+if newDay and not na(dayHigh)
+    pastRanges.unshift(dayHigh - dayLow)
+    if pastRanges.size() > math.max(adrDays, MAX_RANGE_CELLS)
+        pastRanges.pop()
 if newDay or na(dayOpen)
     dayOpen := open
     dayHigh := high
@@ -561,8 +558,9 @@ if fibModuleOn
                 boDnEvt   := true
                 if boMark
                     label.new(bar_index, high, "▼ BREAKDOWN", yloc = yloc.abovebar, style = label.style_label_down, color = color.orange, textcolor = color.white, size = size.tiny)
-            // a wick outside the range without a (pending) break widens the structure
-            if cur.state == 0 and upStreak == 0 and dnStreak == 0 and (high > cur.top or low < cur.bottom)
+            // while the market is still sideways (tight-range test passes) a new high / low
+            // without a (pending) break widens the structure; spikes that fail the test are ignored
+            if cur.state == 0 and isTight and upStreak == 0 and dnStreak == 0 and (high > cur.top or low < cur.bottom)
                 cur.top    := math.max(cur.top, high)
                 cur.bottom := math.min(cur.bottom, low)
                 cur.relayout()
